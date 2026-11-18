@@ -1,0 +1,351 @@
+#!/usr/bin/env node
+'use strict';
+/*
+ * The code-only deploy, in a real browser: build-pwa.js --no-content's own
+ * loader, run on a page, importing a package through the actual file picker
+ * into the actual IndexedDB, then launching on what it stored.
+ *
+ *   node tests/verify-bankstore.js [ignored]
+ *
+ * Needs a browser, not a build: the loader is lifted out of
+ * scripts/build-pwa.js as text — the same bytes the build writes into
+ * index.html — with its placeholders filled the way the build fills them, and
+ * served from a routed origin next to a stand-in app.js. The package is made
+ * by tools/pack-content.js from invented questions. Nothing licensed.
+ *
+ * WHAT IT HOLDS THE DEPLOY TO:
+ *   · with nothing imported, the import screen shows and content/ is never
+ *     requested — the whole point is that the host has none;
+ *   · a package the checker refuses changes nothing, and says so in counts;
+ *   · a good package is stored, and the next launch runs the app on it, its
+ *     figures as blob: URLs that fetch back byte for byte;
+ *   · an import interrupted mid-transaction leaves the previous bank active;
+ *     a new import replaces the old one whole, old figures included;
+ *   · and a NORMAL build's loader is untouched: it fetches content/ as ever,
+ *     and a missing bank is still the "could not load" splash, not an import.
+ */
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { launch, engineName } = require('./_engine.js');
+const { onDeath, watch } = require('./_deathnote.js');
+const { pack } = require('../tools/pack-content.js');
+
+let passed = 0, failed = 0;
+const ok = (label, cond, detail = '') => {
+  cond ? passed++ : failed++;
+  console.log((cond ? '  PASS  ' : '  FAIL  ') + label + (detail ? '  → ' + detail : ''));
+};
+const head = t => console.log('\n── ' + t + ' ──');
+
+const ROOT = path.join(__dirname, '..');
+const read = f => fs.readFileSync(path.join(ROOT, f), 'utf8');
+
+/* The loader, exactly as build-pwa.js holds it. It is a template literal with
+   no interpolations, so evaluating it as one yields the bytes the build uses. */
+function loaderText() {
+  const src = read('scripts/build-pwa.js');
+  const a = src.indexOf('const LOADER = `'), b = src.indexOf('</script>`;', a);
+  if (a < 0 || b < 0) throw new Error('could not find const LOADER in build-pwa.js');
+  const body = src.slice(a + 'const LOADER = `'.length, b + '</script>'.length);
+  if (body.includes('${')) throw new Error('the loader grew an interpolation; lift it differently');
+  return new Function('return `' + body + '`;')();
+}
+const BUILD_ID = '1111111111111111';
+function page(noContent) {
+  const mods = noContent ? '<script>\n' + ['zipread.js', 'bankpack.js', 'bankstore.js'].map(f => read('src/core/' + f)).join('\n') + '\n</script>\n' : '';
+  return '<!doctype html><html><head><meta charset="utf-8"></head><body><div id="splash"><span class="sp-word"></span><span class="sp-sub"></span></div>' + mods +
+    loaderText().replace('__BUILD_ID__', BUILD_ID).replace('__APP_INTEGRITY__', 'sha256-' + require('crypto').createHash('sha256').update(APP).digest('base64')).replace('__COMMIT__', 'c1').replace('__HEART_MESH__', '').replace('__NO_CONTENT__', noContent ? 'true' : 'false') +
+    '</body></html>';
+}
+/* The stand-in app does what the real one does with the notes: fetches the
+   reference seed and a unit's figure file from content/. */
+const APP = "var APP_BUILD_ID='" + BUILD_ID + "'; window.__appRan = { q: ALL_Q.length, ids: ALL_Q.map(function(q){return q.id;}), imgs: IMGS, split: window.SPLIT_BUILD, bank: window.SYSTOLE_BANK || null };" +
+  "Promise.all(['content/refs-seed.json','./content/refs-images/hf.json'].map(function(u){ return fetch(u).then(function(r){ return r.ok ? r.json() : 'status ' + r.status; }).catch(function(e){ return 'error'; }); }))" +
+  ".then(function(v){ window.__refs = v; });";
+
+const WEBP = Buffer.concat([Buffer.from('RIFF'), Buffer.from([20, 0, 0, 0]), Buffer.from('WEBPVP8 '), Buffer.alloc(8, 1)]);
+const JPG = Buffer.concat([Buffer.from([0xFF, 0xD8, 0xFF, 0xE0]), Buffer.alloc(8, 3)]);
+function makePackage(tmp, name, questions, figs, extras) {
+  const c = path.join(tmp, name);
+  fs.mkdirSync(path.join(c, 'figures'), { recursive: true });
+  fs.writeFileSync(path.join(c, 'questions.json'), JSON.stringify(questions));
+  fs.writeFileSync(path.join(c, 'manifest.json'), JSON.stringify({ sourceDigest: 'zz', questions: questions.length, figures: Object.keys(figs).length }));
+  for (const [f, b] of Object.entries(figs)) fs.writeFileSync(path.join(c, 'figures', f), b);
+  const out = path.join(tmp, name + '.zip');
+  pack(c, out, extras);
+  return fs.readFileSync(out);
+}
+
+/* A wait is a precondition, never the claim: if what it waits for never
+   comes, the checks after it report what is actually there. A timeout that
+   killed the suite said only "did not report", never which claim broke. */
+const settle = (pg, fn, arg) => pg.waitForFunction(fn, arg === undefined ? null : arg, { timeout: 15000 }).catch(() => null);
+
+(async () => {
+  const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'bankstore-'));
+  const GOOD = makePackage(TMP, 'good', [
+    { id: 'ZQ_1', ch: 'C', o: ['Zqa', 'Zqb'], ci: 1, img: 1, figs: ['ZQ_1_1.webp'] },
+    { id: 'OAB_2', ch: 'Older ACC bank', o: [{ l: 'A', t: 'Zqx' }, { l: 'B', t: 'Zqy' }], ci: 0, img: 1, figs: ['OAB_2_1.jpg'] },
+  ], { 'ZQ_1_1.webp': WEBP, 'OAB_2_1.jpg': JPG }, {
+    'refs-seed.json': Buffer.from(JSON.stringify([{ id: 'zq-note' }])),
+    'refs-images/hf.json': Buffer.from(JSON.stringify({ 'hf/zq.jpg': 'data:image/jpeg;base64,AAAA' })),
+  });
+  const ONE = makePackage(TMP, 'one', [{ id: 'ZQ_9', ch: 'C', o: ['Zqa', 'Zqb'], ci: 0, img: 1, figs: ['ZQ_9_1.webp'] }], { 'ZQ_9_1.webp': WEBP });
+  /* A package the packer refuses cannot be made WITH it, so the bad one is
+     zipped by the same writer directly: the good files, one figure's bytes
+     wrong for its name. */
+  const BAD = (() => {
+    const c = path.join(TMP, 'good');
+    fs.writeFileSync(path.join(c, 'figures', 'OAB_2_1.jpg'), WEBP);
+    const manifest = JSON.parse(fs.readFileSync(path.join(c, 'manifest.json'), 'utf8'));
+    manifest.schemaVersion = 1;
+    fs.writeFileSync(path.join(c, 'manifest.json'), JSON.stringify(manifest));
+    return require('../scripts/zip.js').zipOf(c, ['manifest.json', 'questions.json', 'figures/OAB_2_1.jpg', 'figures/ZQ_1_1.webp']);
+  })();
+
+  let section = 'setup';
+  const events = [], errors = [];
+  onDeath(() => ({ section, checks: passed + failed, errors, events: events.length ? events.join(', ') : 'none' }));
+  const browser = await launch();
+  const contentHits = [];
+  async function open(noContent, content, init) {
+    const ctx = await browser.newContext();
+    const pg = watch(await ctx.newPage(), events, noContent ? 'no-content' : 'normal', errors);
+    if (init) await pg.addInitScript(init);
+    await pg.route('http://bank.test/**', r => {
+      const u = new URL(r.request().url());
+      if (u.pathname.startsWith('/content/')) {
+        contentHits.push(u.pathname);
+        if (content && u.pathname === '/content/questions.json') return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(content) });
+        return r.fulfill({ status: 404, body: 'not here' });
+      }
+      if (u.pathname === '/app.js') return r.fulfill({ status: 200, contentType: 'text/javascript', body: APP });
+      if (u.pathname === '/sw.js') return r.fulfill({ status: 404, body: '' });
+      return r.fulfill({ status: 200, contentType: 'text/html', body: page(noContent) });
+    });
+    await pg.goto('http://bank.test/');
+    return { ctx, pg };
+  }
+
+  section = 'nothing imported';
+  head('nothing imported: the import screen, and content/ never asked for');
+  const { ctx, pg } = await open(true);
+  await settle(pg, () => document.getElementById('bankImport') || window.__appRan || /Could not/.test(document.querySelector('.sp-word').textContent));
+  const first = await pg.evaluate(() => ({ dialog: !!document.getElementById('bankImport'), ran: !!window.__appRan,
+    splashHidden: document.getElementById('splash').style.display === 'none' }));
+  ok('the import screen is shown, over a hidden splash', first.dialog && first.splashHidden, JSON.stringify(first));
+  ok('and the app is not started on nothing', !first.ran);
+  ok('no request went to content/ at all', contentHits.length === 0, contentHits.join(','));
+
+  section = 'refused package';
+  head('a package the checker refuses changes nothing');
+  const hasPicker = await pg.$('#bankFile');
+  if (hasPicker) await pg.setInputFiles('#bankFile', { name: 'systole-content-v1.zip', mimeType: 'application/zip', buffer: BAD });
+  await settle(pg, () => { const s = document.getElementById('bankStatus'); return s && /Not imported|Imported/.test(s.textContent); });
+  const bad = await pg.evaluate(async () => { const s = document.getElementById('bankStatus');
+    return { status: s ? s.textContent : '(no import screen)', stored: typeof BankStore === 'undefined' ? 'no store' : await BankStore.load() }; });
+  ok('it says it was not imported, and why, in counts and names', /^Not imported: 1 problem\(s\)\. figures\/OAB_2_1\.jpg is not a jpg file/.test(bad.status), bad.status);
+  ok('and nothing was stored', bad.stored === null);
+
+  section = 'good package';
+  head('a good package: stored, and the next launch runs on it');
+  const nav = pg.waitForNavigation({ timeout: 15000 }).catch(() => null);
+  if (hasPicker) await pg.setInputFiles('#bankFile', { name: 'systole-content-v1.zip', mimeType: 'application/zip', buffer: GOOD });
+  const said = await pg.waitForFunction(() => { const s = document.getElementById('bankStatus'); return s && /Imported/.test(s.textContent) && s.textContent; }, null, { timeout: 15000 }).then(h => h.jsonValue()).catch(() => '');
+  ok('it reports what it stored, in counts', /^Imported 2 questions and 2 figures/.test(said), said);
+  await nav;
+  await settle(pg, () => window.__appRan);
+  const ran = await pg.evaluate(async () => {
+    const r = window.__appRan || { q: 0, ids: [], imgs: {}, split: null, bank: null };
+    const url = r.imgs.OAB_2 && r.imgs.OAB_2[0];
+    const bytes = url ? Array.from(new Uint8Array(await (await fetch(url)).arrayBuffer())) : [];
+    return { q: r.q, ids: r.ids, split: r.split, bank: r.bank, url: url || '', bytes, dialog: !!document.getElementById('bankImport') };
+  });
+  ok('the app starts on the imported bank', ran.q === 2 && ran.ids.join(',') === 'ZQ_1,OAB_2' && !ran.dialog, JSON.stringify({ q: ran.q, ids: ran.ids }));
+  ok('its figures are blob: URLs that fetch back byte for byte', /^blob:/.test(ran.url) && Buffer.from(ran.bytes).equals(JPG), ran.url.slice(0, 20));
+  ok('the offline downloader is told this is not the split build (nothing to download)', ran.split === false);
+  ok('and the page can say where its bank came from, in counts', ran.bank && ran.bank.source === 'imported' && ran.bank.questions === 2 && ran.bank.figures === 2, JSON.stringify(ran.bank));
+  await settle(pg, () => window.__refs);
+  const refs = await pg.evaluate(() => window.__refs || null);
+  ok('the notes\' seed and a unit\'s figure file are served from the package', !!refs && Array.isArray(refs[0]) && refs[0][0].id === 'zq-note' &&
+     refs[1] && refs[1]['hf/zq.jpg'] === 'data:image/jpeg;base64,AAAA', JSON.stringify(refs).slice(0, 80));
+  ok('still no request to content/ — not for the bank, not for the notes', contentHits.length === 0, contentHits.join(','));
+
+  section = 'replacement';
+  head('replacing a bank: whole or not at all');
+  /* Bounded: a save that never settles must fail these checks, not hold the
+     suite until the job is killed. */
+  const within = (pr, ms) => Promise.race([pr, new Promise(res => setTimeout(() => res(null), ms))]);
+  const swap = (await within(pg.evaluate(async (one) => {
+    if (typeof BankStore === 'undefined') return { interrupted: '', rawFigs: -1 };
+    const zip = await ZipRead.read(new Uint8Array(one).buffer);
+    const v = BankPack.validate(zip.files);
+    let interrupted = '';
+    try { await BankStore.save(v, { failAfterWrites: true }); } catch (e) { interrupted = String(e && e.message || e); }
+    const afterFail = await BankStore.load({ makeURL: () => 'u' });
+    await BankStore.save(v);
+    const afterNew = await BankStore.load({ makeURL: () => 'u' });
+    /* Every figure in the store, whatever generation — load() only ever reads
+       the active one, so orphans would be invisible through it. */
+    const rawFigs = await new Promise((res, rej) => { const r = indexedDB.open(BankStore.DB); r.onsuccess = () => {
+      const q = r.result.transaction('figs').objectStore('figs').count(); q.onsuccess = () => { res(q.result); r.result.close(); }; q.onerror = rej; }; r.onerror = rej; });
+    return { rawFigs, interrupted, failQ: afterFail && afterFail.questions.length, failF: afterFail && afterFail.figures,
+             newIds: afterNew && afterNew.questions.map(q => q.id), newF: afterNew && afterNew.figures };
+  }, Array.from(ONE)), 30000)) || { interrupted: '', rawFigs: -1, failQ: null, failF: null, newIds: null, newF: null };
+  ok('an import interrupted mid-transaction throws', swap.interrupted.length > 0, swap.interrupted);
+  ok('and leaves the previous bank active, all of it', swap.failQ === 2 && swap.failF === 2, `${swap.failQ} questions, ${swap.failF} figures`);
+  ok('a completed import replaces it whole — the old figures go with it, none left in the store', swap.newIds && swap.newIds.join(',') === 'ZQ_9' && swap.newF === 1 && swap.rawFigs === 1,
+     `${swap.newIds} · ${swap.newF} active figure(s), ${swap.rawFigs} in the store`);
+  /* Two imports stamped with the same millisecond (the `now` option; a coarse
+     clock, or two tabs, do the same). The generation was only the timestamp,
+     so the second wrote into the first's namespace and nothing it lacked was
+     removed: the active bank said one figure and no extras, and loaded two
+     figures and the first package's reference seed. */
+  const same = (await within(pg.evaluate(async ({ good, one }) => {
+    if (typeof BankStore === 'undefined') return null;
+    const v = async b => BankPack.validate((await ZipRead.read(new Uint8Array(b).buffer)).files);
+    const G = await v(good), O = await v(one);
+    const rawFigs = () => new Promise((res, rej) => { const r = indexedDB.open(BankStore.DB); r.onsuccess = () => {
+      const q = r.result.transaction('figs').objectStore('figs').count(); q.onsuccess = () => { res(q.result); r.result.close(); }; q.onerror = rej; }; r.onerror = rej; });
+    const seen = l => l && { ids: l.questions.map(q => q.id).join(','), figs: l.figures, extras: Object.keys(l.extras).sort().join(',') };
+    await BankStore.save(G, { now: 1000 });
+    const first = seen(await BankStore.load({ makeURL: () => 'u' }));
+    await BankStore.save(O, { now: 1000 });
+    const second = seen(await BankStore.load({ makeURL: () => 'u' })), afterSecond = await rawFigs();
+    const both = await Promise.allSettled([BankStore.save(G, { now: 2000 }), BankStore.save(O, { now: 2000 })]);
+    const raced = seen(await BankStore.load({ makeURL: () => 'u' })), afterRace = await rawFigs();
+    return { first, second, afterSecond, saved: both.map(s => s.status).join(','), raced, afterRace };
+  }, { good: Array.from(GOOD), one: Array.from(ONE) }), 30000)) || {};
+  ok('(the first package was stored with its extras)', !!same.first && same.first.ids === 'ZQ_1,OAB_2' && same.first.extras !== '',
+     JSON.stringify(same.first));
+  ok('an import in the same millisecond replaces it whole: its own question and figure, no extras',
+     !!same.second && same.second.ids === 'ZQ_9' && same.second.figs === 1 && same.second.extras === '', JSON.stringify(same.second));
+  ok('and nothing of the earlier package is left in the store', same.afterSecond === 1, String(same.afterSecond));
+  ok('two imports at once in the same millisecond both commit', same.saved === 'fulfilled,fulfilled', String(same.saved));
+  ok('and the bank left active is one of them, whole, with nothing of the other in the store',
+     !!same.raced && ((same.raced.ids === 'ZQ_9' && same.raced.figs === 1 && same.raced.extras === '' && same.afterRace === 1) ||
+                      (same.raced.ids === 'ZQ_1,OAB_2' && same.raced.figs === 2 && same.afterRace === 2 + same.raced.extras.split(',').length)),
+     JSON.stringify(same.raced) + ' · ' + same.afterRace + ' in the store');
+  /* Which form the store took, read from its own meta record. */
+  /* Bounded like the save above: a read queued behind a transaction that
+     never ends would otherwise wait with it. */
+  const storedAs = pg2 => within(pg2.evaluate(() => new Promise(res => { const r = indexedDB.open('systole-bank');
+    r.onsuccess = () => { const q = r.result.transaction('meta').objectStore('meta').get('active'); q.onsuccess = () => { res(q.result && q.result.stored); r.result.close(); }; q.onerror = () => res(null); };
+    r.onerror = () => res(null); })), 5000);
+  if (engineName() === 'chromium')
+    ok('where the browser stores Blobs, the figures are stored as Blobs', await storedAs(pg) === 'blobs', String(await storedAs(pg)));
+
+  head('repeated timestamps and concurrent imports use distinct generations');
+  const collision = await pg.evaluate(async ({ good, one }) => {
+    const first = BankPack.validate((await ZipRead.read(new Uint8Array(good).buffer)).files);
+    const second = BankPack.validate((await ZipRead.read(new Uint8Array(one).buffer)).files);
+    const a = await BankStore.save(first, { buffers: true, now: 12345 });
+    const b = await BankStore.save(second, { buffers: true, now: 12345 });
+    const loaded = await BankStore.load({ makeURL: ()=>'u' });
+    const concurrent = await Promise.all([BankStore.save(first, { buffers: true, now: 12345 }), BankStore.save(second, { buffers: true, now: 12345 })]);
+    const final = await BankStore.load({ makeURL: ()=>'u' });
+    return { distinct: a.gen !== b.gen && concurrent[0].gen !== concurrent[1].gen,
+      figures: loaded.figures, extras: Object.keys(loaded.extras), finalFigures: final.figures };
+  }, { good: Array.from(GOOD), one: Array.from(ONE) });
+  ok('generation identity is unique even at the same clock tick', collision.distinct);
+  ok('replacement drops old figures and optional reference files', collision.figures === 1 && collision.extras.length === 0);
+  ok('concurrent replacements leave exactly the last package', collision.finalFigures === 1);
+  await ctx.close();
+
+  section = 'blobs refused';
+  head('a browser that will not store a Blob in IndexedDB still imports');
+  /* WebKit in an ephemeral session (Private Browsing; every Playwright WebKit
+     context) fails the transaction when a Blob is put. Emulated here on any
+     engine by aborting the transaction a Blob is put into — the shape of the
+     refusal, so the fallback is proven where Blobs work too. The probe's own
+     store is spared, so this exercises the retry after a refused import, not
+     the probe (which the next section does). */
+  const refuse = () => { const put = IDBObjectStore.prototype.put;
+    IDBObjectStore.prototype.put = function (v, k) { const r = put.call(this, v, k);
+      if (v instanceof Blob && this.name !== 'probe') { try { this.transaction.abort(); } catch (_) {} } return r; }; };
+  const rb = await open(true, null, refuse);
+  await settle(rb.pg, () => document.getElementById('bankFile'));
+  const navB = rb.pg.waitForNavigation({ timeout: 15000 }).catch(() => null);
+  if (await rb.pg.$('#bankFile')) await rb.pg.setInputFiles('#bankFile', { name: 'systole-content-v1.zip', mimeType: 'application/zip', buffer: GOOD });
+  const saidB = await rb.pg.waitForFunction(() => { const s = document.getElementById('bankStatus'); return s && /Imported|Not imported|could not|failed/i.test(s.textContent) && s.textContent; }, null, { timeout: 15000 }).then(h => h.jsonValue()).catch(() => '');
+  ok('the import still reports what it stored', /^Imported 2 questions and 2 figures/.test(saidB), saidB);
+  await navB;
+  await settle(rb.pg, () => window.__appRan);
+  const ranB = await rb.pg.evaluate(async () => {
+    const r = window.__appRan || { q: 0, imgs: {} };
+    const url = r.imgs.OAB_2 && r.imgs.OAB_2[0];
+    const bytes = url ? Array.from(new Uint8Array(await (await fetch(url)).arrayBuffer())) : [];
+    return { q: r.q, url: url || '', bytes };
+  });
+  ok('it was stored as plain bytes, the form every engine keeps', await storedAs(rb.pg) === 'buffers', String(await storedAs(rb.pg)));
+  ok('and the app starts on it, its figures blob: URLs that fetch back byte for byte',
+     ranB.q === 2 && /^blob:/.test(ranB.url) && Buffer.from(ranB.bytes).equals(JPG), JSON.stringify({ q: ranB.q, url: ranB.url.slice(0, 12) }));
+  await settle(rb.pg, () => window.__refs);
+  const refsB = await rb.pg.evaluate(() => window.__refs || null);
+  ok('and the notes are served from it too', !!refsB && Array.isArray(refsB[0]) && refsB[0][0].id === 'zq-note', JSON.stringify(refsB).slice(0, 60));
+  await rb.ctx.close();
+
+  section = 'blobs hang';
+  head('a browser where a Blob put never finishes still imports');
+  /* The other shape WebKit showed: no error, no completion, the import
+     silent until the job was killed. Emulated by keeping the transaction a
+     Blob is put into busy forever, so it can neither commit nor fail. */
+  const hang = () => { const put = IDBObjectStore.prototype.put;
+    const busy = s => { try { const r = s.count(); r.onsuccess = () => busy(s); } catch (_) {} };
+    IDBObjectStore.prototype.put = function (v, k) { if (v instanceof Blob) { busy(this); return {}; } return put.call(this, v, k); }; };
+  const hb = await open(true, null, hang);
+  await settle(hb.pg, () => document.getElementById('bankFile'));
+  const navH = hb.pg.waitForNavigation({ timeout: 20000 }).catch(() => null);
+  if (await hb.pg.$('#bankFile')) await hb.pg.setInputFiles('#bankFile', { name: 'systole-content-v1.zip', mimeType: 'application/zip', buffer: GOOD });
+  const saidH = await hb.pg.waitForFunction(() => { const s = document.getElementById('bankStatus'); return s && /Imported|Not imported/.test(s.textContent) && s.textContent; }, null, { timeout: 20000 }).then(h => h.jsonValue()).catch(() => '');
+  ok('the import reports what it stored, instead of waiting for ever', /^Imported 2 questions and 2 figures/.test(saidH), saidH || '(nothing within 20 s)');
+  await navH;
+  await settle(hb.pg, () => window.__appRan);
+  const hs = await storedAs(hb.pg);
+  ok('stored as plain bytes, and the app starts on it', hs === 'buffers' &&
+     await within(hb.pg.evaluate(() => !!window.__appRan && window.__appRan.q === 2), 5000) === true, String(hs));
+  await within(hb.ctx.close(), 5000);
+
+  section = 'old Safari';
+  head('on a Safari without Blob.arrayBuffer(), the import screen still reads the package');
+  /* The method came in Safari 14 and the floor is iPadOS 13.4. The loader's import screen reads the package before the app can open at all, so
+     a call that is a TypeError there leaves the device with a screen that says the file could not be read and nothing behind it. The page is
+     made to lack the method the way that Safari does, before the loader runs, and the same two methods are gone again when it reloads into the
+     app. */
+  const lack = () => { delete Blob.prototype.arrayBuffer; delete Blob.prototype.text; };
+  const ob = await open(true, null, lack);
+  await settle(ob.pg, () => document.getElementById('bankFile'));
+  const lacks = await within(ob.pg.evaluate(() => { const f = new File(['x'], 'p.zip'); return typeof f.arrayBuffer === 'undefined' && typeof f.text === 'undefined'; }), 5000);
+  const navO = ob.pg.waitForNavigation({ timeout: 20000 }).catch(() => null);
+  if (await ob.pg.$('#bankFile')) await ob.pg.setInputFiles('#bankFile', { name: 'systole-content-v1.zip', mimeType: 'application/zip', buffer: GOOD });
+  const saidO = await ob.pg.waitForFunction(() => { const s = document.getElementById('bankStatus'); return s && /Imported|Not imported/.test(s.textContent) && s.textContent; }, null, { timeout: 20000 }).then(h => h.jsonValue(), () => null);
+  ok('the page lacks both methods, as Safari 13 does', lacks === true);
+  ok('and the package is read and imported all the same', /^Imported 2 questions and 2 figures/.test(saidO), saidO || '(nothing within 20 s)');
+  await navO;
+  await settle(ob.pg, () => window.__appRan);
+  ok('and the app starts on it at the next launch, the page still lacking the method',
+     await within(ob.pg.evaluate(() => !!window.__appRan && window.__appRan.q === 2 && typeof new File(['x'], 'p.zip').arrayBuffer === 'undefined'), 5000) === true);
+  await within(ob.ctx.close(), 5000);
+
+  section = 'normal build';
+  head('a normal build\'s loader is exactly as it was');
+  contentHits.length = 0;
+  const n1 = await open(false, [{ id: 'ZQ_5', ch: 'C', o: ['a', 'b'], ci: 0, img: 0 }]);
+  await settle(n1.pg, () => window.__appRan || document.getElementById('bankImport'));
+  const norm = await n1.pg.evaluate(() => ({ q: window.__appRan ? window.__appRan.q : 0, split: window.__appRan ? window.__appRan.split : null, dialog: !!document.getElementById('bankImport'), store: typeof BankStore }));
+  ok('it fetches content/questions.json and starts the app on it', norm.q === 1 && contentHits.includes('/content/questions.json'), JSON.stringify(norm));
+  ok('as the split build, with no import screen and no bank store in the page', norm.split === true && !norm.dialog && norm.store === 'undefined');
+  await n1.ctx.close();
+  const n2 = await open(false, null);
+  await settle(n2.pg, () => /Could not load/.test(document.querySelector('.sp-word').textContent) || document.getElementById('bankImport'));
+  const miss = await n2.pg.evaluate(() => ({ word: document.querySelector('.sp-word').textContent, sub: document.querySelector('.sp-sub').textContent, dialog: !!document.getElementById('bankImport') }));
+  ok('and a missing bank is still the "could not load" splash, naming the 404 — not an import screen',
+     miss.word === 'Could not load the question bank' && /404/.test(miss.sub) && !miss.dialog, miss.sub.slice(0, 60));
+  await n2.ctx.close();
+
+  await browser.close();
+  fs.rmSync(TMP, { recursive: true, force: true });
+  console.log(`\n${passed} passed, ${failed} failed`);
+  process.exit(failed ? 1 : 0);
+})();

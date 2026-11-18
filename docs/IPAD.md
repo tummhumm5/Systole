@@ -1,0 +1,353 @@
+# Getting Systole onto an iPad, in Safari
+
+The short version: **iOS and iPadOS Safari cannot open a local HTML file.** Not
+from Files, not from iCloud Drive, not by typing a `file://` URL — Apple removed
+that in iOS 8 and has not put it back. That single restriction is the whole
+reason a 32 MB `systole.html` needs a third-party app like Documents to open at
+all, and no amount of work on the file itself changes it.
+
+So the file has to come from a URL. The good news is that once it does, Safari
+gives you something better than Documents ever could: **Add to Home Screen**
+turns Systole into a real app — its own icon, no browser chrome, its own window
+in Split View — and the service worker keeps it working with the network off.
+
+Two windows of it at once in one browser (two tabs, or two Safari windows in
+Split View) share one progress record and one set of reference notes, and each
+takes what the other wrote as it is written, or when it is next looked at if it
+was suspended; the question on screen is left alone. Two answers given in the
+two windows within a moment of each other, before either has heard of the other,
+are still decided by whichever wrote last. The ink, the sticky notes, the chats
+and the review log are kept in the database, which does not tell the other
+window: for those, whichever window wrote last wins, so annotate in one.
+
+Build the thing you host:
+
+```bash
+npm run build   # → build/systole.html   (the export: SYSTOLE_SRC, or the one file in source/)
+npm run pwa     # → content/, then dist/
+```
+
+`npm run build` is `scripts/assemble-app.js`. `npm run pwa` runs the next two
+steps together, in order: `extract-content.js`, then `build-pwa.js`. If you run
+those two scripts by hand instead, run **both, in that order, every time.** The
+first is easy to skip on a rebuild — `content/` is already there, so the split
+appears to work. It does not: `dist/index.html` and `dist/app.js` would be the new build and
+`dist/content/` the old one, and nothing on screen would say so. `build-pwa.js`
+now compares the digest `extract-content.js` wrote into `content/manifest.json`
+against the file it is splitting and refuses the pair when they disagree,
+naming both. This sequence is what the refusal is asking for.
+
+`dist/` is a plain static folder — the bank, its figures, the reference notes'
+figures, the shell and the fonts, and nothing else (`build-pwa.js` prints its
+largest file on every build). Nothing in it needs a server that can run
+code, so any static host will do.
+
+---
+
+## Which route
+
+| | Where the content lives | Offline | Effort |
+|---|---|---|---|
+| **Tailscale** | your own machine | full, after one download | one install |
+| **Cloudflare Pages + Access** | Cloudflare, behind a login | full | ~15 min, needs an account |
+| **Plain LAN over HTTP** | your own machine | **no** | one command |
+
+**The question bank is licensed.** Tailscale keeps it on hardware you own and
+serves it only to your own devices. Cloudflare means uploading it to someone
+else's storage, private URL or not. That is a judgement call about your licence,
+not a technical one — which is why there is no single recommendation here.
+
+---
+
+## 1. Tailscale — private, TLS, nothing uploaded
+
+Tailscale gives your machines a private network with real HTTPS certificates.
+The iPad talks to your laptop directly; nothing is published anywhere.
+
+It takes two commands because of a macOS limitation worth knowing about:
+`tailscale serve` can point at a **folder** or at a **local port**, but the
+folder form is unavailable on the Mac App Store and Standalone builds — the app
+sandbox forbids it. So a small web server holds the folder, and Tailscale
+proxies its port. That form works on every platform, so it is the one
+documented here.
+
+```bash
+# 1. serve the folder locally. python3 ships with macOS; nothing to install.
+cd /path/to/dist
+python3 -m http.server 8080
+
+# 2. in a second terminal, put that port on your tailnet
+tailscale serve --bg 8080
+tailscale serve status          # prints the https://<machine>.<tailnet>.ts.net URL
+```
+
+The first `tailscale serve` will offer to enable HTTPS certificates for your
+tailnet if they are not already on — say yes; the URL depends on it.
+
+`python3 -m http.server` is enough: the suite passes 34/34 against it, with the
+manifest, the woff2 faces, the webp figures and the service worker all served
+under the right content types by its stock table. If you would rather use the
+repo's own server, `node scripts/serve.js 8080 dist` is equivalent.
+
+Install Tailscale on the iPad from the App Store, sign in to the same account,
+open that URL in Safari, then **Share → Add to Home Screen**.
+
+To stop sharing: `tailscale serve off`.
+
+Why this works when a LAN address does not: service workers require a *secure
+context*. `https://….ts.net` is one; `http://192.168.1.42` is not. No secure
+context means no service worker, which means no offline and no real install —
+just a web page that stops working when you close the laptop.
+
+**Press "Download the rest" first.** Figures are otherwise fetched one at a
+time, as you meet the questions that use them — which would mean every figure
+you had not already seen was a broken image the moment the laptop slept. The
+card on the Progress screen pulls every figure down in one go, over the wifi you
+are already on. After that the tablet holds the whole
+bank whether or not the machine that served it still exists.
+
+## 2. Cloudflare Pages + Access — works from anywhere, and needs no computer
+
+Free, Access is free for up to 50 users, and the whole thing can be done from
+the iPad: the dashboard's direct upload takes a **zip**, not just a folder, so
+the zipped `dist/` can be picked straight out of Files.
+
+### Making that zip, which is not as obvious as it looks
+
+Two things have to be true, and the obvious Windows command gets the second
+one wrong in a way nothing warns you about.
+
+**The contents of `dist/` go at the root of the zip, not a `dist` folder.**
+Cloudflare looks for `index.html` and `_worker.js` at the top level of what it
+unpacks. Open the finished zip: if the first thing you see is `index.html`
+beside `_worker.js`, it is right. If it is a folder called `dist`, the site
+will 404 and the Worker holding the Gemini key will never be installed.
+
+**The paths inside must use forward slashes.** The zip format requires `/`.
+Windows PowerShell 5.1's `Compress-Archive` writes `\` instead —
+`content\questions.json` — and nothing complains: iOS Files shows tidy
+folders, because its unzipper guesses. Cloudflare's does not. It reads
+`content\questions.json` as one oddly-named file at the root, so no `content/`
+directory is ever created and every figure, font and icon is missing while the
+five root files work perfectly. The app loads, the service worker installs,
+and the splash says **"Could not load the question bank"**, with a second line
+naming which failure it was. When this happened that second line read *"open
+this over http, not as a file"* — the only sentence the loader had, and the
+wrong one, which is why it sent the search in the wrong direction. It now says
+*"content/questions.json is not on the server (404) — if this was just
+deployed, the content folder did not make it into the upload"*, which is the
+sentence that would have ended it in a minute.
+
+This happened. 420 of 425 entries were affected; the five that were not are
+the five at the root.
+
+Either of these writes correct paths:
+
+```powershell
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+[System.IO.Compression.ZipFile]::CreateFromDirectory("C:\path\to\drnerd\dist", "$HOME\Desktop\systole-dist.zip")
+```
+
+```powershell
+tar.exe -a -c -f "$HOME\Desktop\systole-dist.zip" -C dist .
+```
+
+```bash
+cd dist && zip -r ../systole-dist.zip .        # macOS and Linux
+```
+
+To check a zip before uploading it, on any machine with Python:
+
+```bash
+python3 -c "import zipfile,sys; n=zipfile.ZipFile(sys.argv[1]).namelist(); print(sum('\\' in x for x in n), 'of', len(n), 'entries use backslashes')" systole-dist.zip
+```
+
+Zero is the only acceptable answer.
+
+NOTHING IN THE TEST SUITE CAN CATCH THIS. The build produces a correct
+`dist/`; the damage happens afterwards, in a tool outside the repository, to
+an artefact nobody verifies again. That is exactly why it is written down here
+rather than left to be rediscovered.
+
+### Deploying it
+
+1. Cloudflare dashboard → **Workers & Pages** → **Create** → **Pages** →
+   **Upload assets**. Give it a name, then choose the zip.
+2. **Settings → Access** on the new project → require your email address.
+   Cloudflare's Pages docs say this switch covers the preview addresses; their
+   "Enable Access on your `*.pages.dev` domain" steps put the `*.pages.dev`
+   address itself behind Access, and that is the address the iPad opens.
+3. **Settings → Environment variables → Add variable**, name `GEMINI_API_KEY`,
+   paste your AI Studio key, and press **Encrypt** before saving. Then add two
+   more the same way. They tell the Worker which Access sign-in to believe:
+   - `ACCESS_TEAM_DOMAIN`: your Zero Trust team domain, such as
+     `yourteam.cloudflareaccess.com`;
+   - `ACCESS_AUD`: the **Application Audience (AUD) Tag** of the Access
+     application in front of that `*.pages.dev` address. It is shown on the
+     application in the Zero Trust dashboard (**Access → Applications**).
+     Preview addresses sit behind a different Access application with a
+     different tag, so the hosted key refuses requests made from a preview.
+
+   Redeploy once so the running Worker picks them up. Until both are set, the
+   hosted key refuses every request and the refusal names the missing variable
+   (the app reports it as a rejected API key). A key pasted into Apex settings
+   still works, because it never goes through the Worker.
+4. Open the `*.pages.dev` URL on the iPad, sign in once, **Add to Home Screen**.
+5. Press **Download the rest** on the home screen.
+
+### The key lives on the edge now
+
+`_worker.js` at the root of the upload makes the deployment a Worker as well as
+a site: it answers `/api/apex/gemini/*` with your key attached server-side, and
+hands every other request straight back to the static site. Apex opens with
+nothing to type.
+
+That is Gemini only. **Mistral is still bring-your-own-key**, and so is Gemini
+the moment you paste a key into Apex settings — a key you typed always wins.
+The single-file `systole.html` has no server at all, so it is always BYOK.
+
+What bounds the cost: Access means only your signed-in address can reach the
+endpoint, and the Worker checks that itself instead of assuming it. It reads
+the token Access signs on each request (`Cf-Access-Jwt-Assertion`) and checks
+it against your team's published keys, `ACCESS_TEAM_DOMAIN` and `ACCESS_AUD`.
+It does not trust a header that only names you, because anyone can type that
+header. With no Access in front, it refuses rather than serves. Beyond that,
+the Worker clamps `maxOutputTokens` to 2000 whatever the browser asks
+for, caps the request body at 6 MB, and refuses any model that is not a Gemini
+one. The per-minute limiter is **best-effort** unless you give it a database: a
+Worker isolate has no shared counter, so on its own it is a speed bump against a
+runaway loop rather than a quota. To make it one count everywhere, bind a D1
+database to the Pages project as `APEX_DB` (Settings → Bindings → Add → D1
+database; create an empty database first, under Storage & Databases → D1). The
+Worker makes its one table on first use and keeps one row per caller per
+minute; `APEX_RPM` (default 20) is still the limit. If the database ever fails,
+the per-isolate limiter answers instead. Do this before you share the URL with
+anyone. (Workers' own rate-limiting binding is not offered to Pages projects,
+and KV is eventually consistent and write-limited, which is why it is D1.)
+
+The platform limit that binds is Cloudflare Pages' per-file ceiling — labelled
+"25 MiB" but enforced at **25,000,000 bytes**. The note figures are the files
+that approach it, so they ship **one file per unit** (`content/refs-images/<unit>.json`):
+adding a unit adds a file rather than growing a shared one, and a unit that
+outgrows one file continues in `<unit>.2.json`, `<unit>.3.json` (a unit that
+fits keeps its one file and its URL). `build-pwa.js`
+refuses a `dist/` with any file over the ceiling and prints the largest file on
+every build, so the margin is on screen before a deploy rather than discovered
+after one. (This used to be one `refs-images.json` for the whole shelf; it
+reached 25.7 MiB with the arrhythmias unit and a deploy broke under it.)
+
+Fully offline afterwards, and reachable from a hospital wifi. The trade is that
+`dist/content/` — the bank and its figures — sits on Cloudflare's storage.
+
+**An authenticating proxy does not answer with an error.** Access with an
+expired session replies `200 OK` and a sign-in page, which is exactly what a
+naive downloader counts as a figure. So every response is checked for an
+`image/` content type before it counts, anything else is deleted back out of
+the cache rather than left there pretending, and the card turns amber and says
+how many failed. Sign in again in a browser tab and press the button once more.
+
+## 3. Plain LAN — quickest, and the most limited
+
+```bash
+node scripts/serve.js 8080 dist          # then browse http://<your-ip>:8080
+```
+
+Fine for a look. No service worker (see above), so no offline and no install.
+
+---
+
+## Putting the whole bank on the tablet
+
+The split build streams figures on demand — the right default for a web app,
+and the wrong one for a ward round. So the Progress screen carries a card (it
+lived under the doors on the home screen until that screen had to fit an 11-inch
+iPad held sideways):
+
+```
+ON THIS DEVICE                          0 of N figures here
+▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+Pull every figure down once and the bank works
+with no network at all.              [ Download the rest ]
+```
+
+It does not keep a cache of its own: it only *requests* each figure, and the
+service worker's ordinary fetch handler does the storing — the same cache, with
+the same name and the same eviction, that a figure met the normal way goes
+through. Six requests at a time, about ten seconds on a laptop over Tailscale,
+and a reload afterwards finds every one without fetching one of them again.
+(N is every figure the bank references: the export's, plus the older ACC bank's
+when it is merged.)
+
+The card appears only in the split build. In the single file every figure is
+already inline, and a button offering to download them would be a lie.
+
+## A code-only deploy: the bank never leaves your devices
+
+Every route above hosts the bank somewhere — on your laptop, or on
+Cloudflare's storage behind Access. There is a fourth arrangement where the
+host carries **no licensed content at all**: the app is deployed as code, and
+the bank lives only in the iPad's own storage, imported once from Files.
+
+On the laptop, after the usual build and extract:
+
+```
+node scripts/build-pwa.js build/systole.html --no-content
+```
+
+That one command does both halves. It builds `dist/` exactly as usual — every
+check still runs on the real bank — then packs the bank as it ships, its
+figures, the reference notes' seed and every unit's figure file into
+`source/systole-content-v1.zip` (checked with the very code the iPad runs, so a
+package the iPad would refuse is refused here), and leaves all of them out of
+`dist/`. Deploy `dist/` by any route above; there is nothing licensed in it to
+protect. `source/` is gitignored and the leak guard refuses it; keep the zip on
+your own devices (AirDrop it to the iPad, or put it in Files).
+(`node tools/pack-content.js` makes a bank-only package from `content/` on its
+own, if you ever want one without the notes.)
+
+On the iPad, the first launch shows **Import your study content** instead of
+the home screen. Pick the zip. It is read, checked (a bad package is refused,
+naming the problem in counts and file names, and changes nothing) and stored
+in the browser's IndexedDB in one transaction; the app then opens on it, fully
+offline, figures included. Re-importing a newer package replaces the old one
+whole; your progress, ink, notes and chats live in a separate store and are
+untouched, keyed by question id.
+
+What this does not change: the app itself is still built from your export on
+the laptop, by the patch chain. What changes is where the bank and the notes
+live afterwards — nowhere but on your devices. The app asks for its notes from
+`content/` as it always has; in this build those requests are answered from the
+imported package, and nothing is asked of the host.
+
+## What "installed" gets you
+
+The shell is 559 KB and the head already declares everything Safari needs:
+`mobile-web-app-capable` and its `apple-` twin, `apple-mobile-web-app-title`,
+a black-translucent status bar, `viewport-fit=cover` so the layout runs under
+the rounded corners, an `apple-touch-icon`, and a web manifest that asks for
+`display: standalone`.
+
+Fonts, the question bank and the figures are separate cacheable files rather
+than base64 inside the HTML — 250 KB of typeface alone that Safari no longer
+has to parse before it can draw anything.
+
+## Known limits, stated plainly
+
+- **Not verified on real Safari.** The suites run against Chromium; WebKit is
+  not installed in the build environment. Everything here follows from
+  documented WebKit behaviour and from the shell's own contents, but nobody has
+  watched it boot on an actual iPad.
+- **`backdrop-filter`** carries `-webkit-` prefixes throughout, which is what
+  Safari wants.
+- **Storage is evictable in a Safari tab.** After seven days of Safari use with
+  no visit to the site, Safari deletes all of its saved data (localStorage,
+  IndexedDB and the service worker's cache together). A Home Screen web app is
+  exempt (webkit.org/tracking-prevention), so install it; your progress also
+  rides in the export bundle, so take one before a long break. In a tab, the
+  Progress screen's data panel says this too.
+
+## Memorizer on the iPad
+
+Memorizer moved to its own repository,
+[drfahadkhan477-lab/Memorizer](https://github.com/drfahadkhan477-lab/Memorizer),
+with how to put it on the iPad and on a laptop.
